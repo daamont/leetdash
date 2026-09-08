@@ -375,6 +375,7 @@ describe("review Markdown rendering", () => {
         requestId: "request-42",
         clientRequestId: "client-request-42",
         attemptCount: 2,
+        providerDetail: "code=400 | message=No allowed providers are available",
       }),
       runUrl: "https://github.com/example/leetdash/actions/runs/42",
     });
@@ -384,6 +385,7 @@ describe("review Markdown rendering", () => {
     expect(markdown).toContain("단계: model-request");
     expect(markdown).toContain("사유: MODEL_REQUEST_FAILED");
     expect(markdown).toContain("상세: OpenCode request failed.");
+    expect(markdown).toContain("제공자 상세: code=400 \\| message=No allowed providers are available");
     expect(markdown).toContain("재시도 가능: 예");
     expect(markdown).toContain("HTTP 상태: 429");
     expect(markdown).toContain("요청 ID: request-42");
