@@ -9,7 +9,7 @@ const reviewContentMarkerPattern = /^<!-- leetdash-opencode-review-content:([a-f
 const reviewModelMarkerPattern = /^<!-- leetdash-opencode-review-model:([a-z0-9][a-z0-9./_-]*) -->$/;
 
 class ReviewFailure extends Error {
-  constructor({ stage, reason, detail, retryable = false, httpStatus, requestId, clientRequestId, attemptCount }) {
+  constructor({ stage, reason, detail, retryable = false, httpStatus, requestId, clientRequestId, attemptCount, providerDetail }) {
     super(detail);
     this.name = "ReviewFailure";
     this.stage = stage;
@@ -20,6 +20,7 @@ class ReviewFailure extends Error {
     this.requestId = requestId;
     this.clientRequestId = clientRequestId;
     this.attemptCount = attemptCount;
+    this.providerDetail = providerDetail;
   }
 }
 
@@ -252,6 +253,7 @@ function warningLines(failure) {
     `단계: ${markdownText(failure.stage)}`,
     `사유: ${markdownText(failure.reason)}`,
     `상세: ${markdownText(failure.detail)}`,
+    ...(failure.providerDetail === undefined ? [] : [`제공자 상세: ${markdownText(failure.providerDetail)}`]),
     `재시도 가능: ${failure.retryable ? "예" : "아니요"}`,
   ];
   if (failure.httpStatus !== undefined) lines.push(`HTTP 상태: ${markdownText(failure.httpStatus)}`);

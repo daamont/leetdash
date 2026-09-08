@@ -10,6 +10,44 @@ import {
 import { parseManagedReviewMarker, ReviewFailure } from "./opencode-review-core.mjs";
 
 const goUsageLimitErrorName = "GoUsageLimitError";
+const maxProviderDetailFieldLength = 300;
+const maxProviderDetailLength = 700;
+
+function redactProviderDetail(value, sensitiveValues) {
+  let sanitized = String(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  for (const sensitiveValue of sensitiveValues) {
+    if (typeof sensitiveValue === "string" && sensitiveValue.length > 0) {
+      sanitized = sanitized.replaceAll(sensitiveValue, "[REDACTED]");
+    }
+  }
+  sanitized = sanitized
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9._-]{8,}\b/gi, "[REDACTED]");
+  return sanitized.length <= maxProviderDetailFieldLength
+    ? sanitized
+    : `${sanitized.slice(0, maxProviderDetailFieldLength - 1)}\u2026`;
+}
+
+function extractSafeProviderDetail(body, { apiKey, prompt } = {}) {
+  const error = body?.error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return undefined;
+  const sensitiveValues = [apiKey, prompt];
+  const fields = [];
+  for (const name of ["code", "type", "message"]) {
+    const value = error[name];
+    if (typeof value !== "string" && typeof value !== "number") continue;
+    const sanitized = redactProviderDetail(value, sensitiveValues);
+    if (sanitized) fields.push(`${name}=${sanitized}`);
+  }
+  if (fields.length === 0) return undefined;
+  const detail = fields.join(" | ");
+  return detail.length <= maxProviderDetailLength
+    ? detail
+    : `${detail.slice(0, maxProviderDetailLength - 1)}\u2026`;
+}
 
 function extractRequestId(response) {
   const headers = response?.headers;
@@ -21,7 +59,7 @@ function extractRequestId(response) {
   return undefined;
 }
 
-function toSafeHttpFailure({ stage, reason, response, clientRequestId, detail = "External service request failed." }) {
+function toSafeHttpFailure({ stage, reason, response, clientRequestId, detail = "External service request failed.", providerDetail }) {
   const httpStatus = response?.status;
   return new ReviewFailure({
     stage,
@@ -31,6 +69,7 @@ function toSafeHttpFailure({ stage, reason, response, clientRequestId, detail = 
     ...(httpStatus === undefined ? {} : { httpStatus }),
     ...(extractRequestId(response) === undefined ? {} : { requestId: extractRequestId(response) }),
     clientRequestId,
+    providerDetail,
   });
 }
 
@@ -86,7 +125,7 @@ class OpenCodeClient {
     }
 
     const clientRequestId = this.requestIdFactory();
-    const logOutcome = ({ outcome, status, requestId }) => {
+    const logOutcome = ({ outcome, status, requestId, providerDetail }) => {
       const fields = [
         `outcome=${outcome}`,
         `attempt=${attempt}`,
@@ -94,6 +133,7 @@ class OpenCodeClient {
       ];
       if (status !== undefined) fields.push(`status=${status}`);
       if (requestId !== undefined) fields.push(`provider_request_id=${requestId}`);
+      if (providerDetail !== undefined) fields.push(`provider_detail=${JSON.stringify(providerDetail)}`);
       try {
         this.logger?.log?.(`OpenCode request ${fields.join(" ")}`);
       } catch {
@@ -210,14 +250,16 @@ class OpenCodeClient {
       }
 
       if (!response?.ok) {
+        const providerDetail = extractSafeProviderDetail(body, { apiKey, prompt });
         const failure = toSafeHttpFailure({
           stage: "model-request",
           reason: "MODEL_REQUEST_FAILED",
           response,
           clientRequestId,
           detail: `OpenCode request failed (HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}).`,
+          providerDetail,
         });
-        logOutcome({ outcome: "failure", status: failure.httpStatus, requestId: failure.requestId });
+        logOutcome({ outcome: "failure", status: failure.httpStatus, requestId: failure.requestId, providerDetail });
         throw failure;
       }
 

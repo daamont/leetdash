@@ -204,6 +204,60 @@ describe("OpenCodeClient", () => {
     });
   });
 
+  it("exposes sanitized structured provider errors in failures and request logs", async () => {
+    const logs = [];
+    const apiKey = "sk-super-secret-api-key";
+    const prompt = "submitted-source-secret";
+    const client = new OpenCodeClient({
+      fetchImpl: async () => jsonResponse({
+        error: {
+          code: "400",
+          type: "bad_request_error",
+          message: `No allowed providers are available; key=${apiKey}; prompt=${prompt}`,
+        },
+      }, { status: 400 }),
+      logger: { log: (message) => { logs.push(message); } },
+      requestIdFactory: () => "client-request-42",
+    });
+
+    const failure = await client.review({
+      model: "opencode-go/mimo-v2.5",
+      apiKey,
+      prompt,
+    }).catch((error) => error);
+
+    expect(failure).toMatchObject({
+      providerDetail: "code=400 | type=bad_request_error | message=No allowed providers are available; key=[REDACTED]; prompt=[REDACTED]",
+    });
+    expect(logs).toEqual([
+      'OpenCode request outcome=failure attempt=1 client_request_id=client-request-42 status=400 provider_detail="code=400 | type=bad_request_error | message=No allowed providers are available; key=[REDACTED]; prompt=[REDACTED]"',
+    ]);
+    expect(JSON.stringify({ failure, logs })).not.toMatch(/sk-super-secret-api-key|submitted-source-secret/);
+  });
+
+  it("limits provider diagnostics and ignores unapproved response fields", async () => {
+    const client = new OpenCodeClient({
+      fetchImpl: async () => jsonResponse({
+        error: {
+          code: "c".repeat(2_000),
+          type: "t".repeat(2_000),
+          message: "x".repeat(2_000),
+        },
+        request: { prompt: "must-not-be-exposed" },
+      }, { status: 400 }),
+    });
+
+    const failure = await client.review({
+      model: "opencode-go/mimo-v2.5",
+      apiKey: "test-secret",
+      prompt: "review prompt",
+    }).catch((error) => error);
+
+    expect(failure.providerDetail).toMatch(/^code=c+\u2026 \| type=t+\u2026 \| message=x+\u2026$/);
+    expect(failure.providerDetail.length).toBeLessThanOrEqual(700);
+    expect(failure.providerDetail).not.toContain("must-not-be-exposed");
+  });
+
   it("redacts API keys and provider response bodies from request failures", async () => {
     const apiKey = "test-secret";
     const responseBody = "provider-body-secret";
