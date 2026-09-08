@@ -1,5 +1,11 @@
 {
     "users": [
+		{
+            "id": "admin",
+            "displayName": "운영자",
+            "githubUsername": "koreanddinghwan",
+            "active": true
+		},
         {
             "id": "mygo",
             "displayName": "강명환",
@@ -82,6 +88,18 @@
 			"id": "daamont",
 			"displayName": "박수민",
 			"githubUsername": "daamont",
+			"active": true
+		},
+		{
+			"id": "leegy21",
+			"displayName": "이가영",
+			"githubUsername": "leegy21",
+			"active": true
+		},
+		{
+			"id": "anfdml",
+			"displayName": "김준성",
+			"githubUsername": "anfdml",
 			"active": true
 		}
     ]

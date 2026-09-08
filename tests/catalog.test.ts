@@ -4,19 +4,74 @@ import {
   getListProblems,
   getProblem,
   getProblemSourceUrl,
+  mergeDynamicProblems,
   problemByKey,
+  type ProblemCatalog,
 } from "@/lib/catalog";
 
 describe("problem catalog", () => {
+  it("merges dynamic SWEA problems into the provider catalog without replacing static metadata", () => {
+    const base = {
+      generatedAt: "2026-08-23T00:00:00.000Z",
+      sources: [],
+      problems: [
+        {
+          provider: "swea",
+          problemId: "1206",
+          problemKey: "swea:1206",
+          title: "View",
+          difficulty: "D3",
+          sourceUrl: "https://swexpertacademy.com/1206",
+        },
+      ],
+      lists: [
+        {
+          key: "swea",
+          title: "SWEA",
+          url: "https://swexpertacademy.com",
+          summary: [],
+          problems: [],
+          items: [],
+        },
+      ],
+    } as ProblemCatalog;
+
+    const merged = mergeDynamicProblems(base, [
+      {
+        provider: "swea",
+        problemId: "76543210",
+        problemKey: "swea:76543210",
+        title: "동적 문제",
+        difficulty: "Unknown",
+        sourceUrl: "https://swexpertacademy.com/76543210",
+      },
+      {
+        provider: "swea",
+        problemId: "1206",
+        problemKey: "swea:1206",
+        title: "덮어쓰면 안 됨",
+        difficulty: "Unknown",
+        sourceUrl: "https://swexpertacademy.com/other",
+      },
+    ]);
+
+    expect(merged.problems.find((problem) => problem.problemKey === "swea:1206")?.title).toBe("View");
+    expect(merged.problems.find((problem) => problem.problemKey === "swea:76543210")?.title).toBe("동적 문제");
+    expect(merged.lists[0].items.at(-1)).toMatchObject({
+      problemKey: "swea:76543210",
+      submissionKey: "76543210",
+    });
+  });
+
   it("loads the planned provider lists with expected counts", () => {
     expect(catalog.lists.map((list) => [list.key, list.items.length])).toEqual([
       ["top-interview-easy", 49],
       ["leetcode-75", 75],
       ["top-interview-150", 150],
       ["programmers", 689],
-      ["swea", 1124],
+      ["swea", 1160],
       ["programmers-high-score-kit", 47],
-      ["leetcode", 4017],
+      ["leetcode", 4029],
     ]);
   });
 
@@ -93,6 +148,10 @@ describe("problem catalog", () => {
     expect(problemByKey.get("swea:1206")).toMatchObject({
       title: "[S/W 문제해결 기본] 1일차 - View",
       difficulty: "D3",
+    });
+    expect(problemByKey.get("swea:4012")).toMatchObject({
+      title: "[모의 SW 역량테스트] 요리사",
+      difficulty: "Unknown",
     });
 
     expect(getProblem("programmers:12906")).toBe(problemByKey.get("programmers:12906"));

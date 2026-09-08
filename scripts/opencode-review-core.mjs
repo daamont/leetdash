@@ -6,9 +6,10 @@ const truncationNotice = "\n\n> _Review truncated to fit the GitHub comment limi
 const reviewSummaryMarker = "<!-- leetdash-opencode-review -->";
 const reviewFileMarkerPattern = /^<!-- leetdash-opencode-review-file:([a-f0-9]{64}) -->$/;
 const reviewContentMarkerPattern = /^<!-- leetdash-opencode-review-content:([a-f0-9]{64}) -->$/;
+const reviewModelMarkerPattern = /^<!-- leetdash-opencode-review-model:([a-z0-9][a-z0-9./_-]*) -->$/;
 
 class ReviewFailure extends Error {
-  constructor({ stage, reason, detail, retryable = false, httpStatus, requestId, clientRequestId, attemptCount }) {
+  constructor({ stage, reason, detail, retryable = false, httpStatus, requestId, clientRequestId, attemptCount, providerDetail }) {
     super(detail);
     this.name = "ReviewFailure";
     this.stage = stage;
@@ -19,6 +20,7 @@ class ReviewFailure extends Error {
     this.requestId = requestId;
     this.clientRequestId = clientRequestId;
     this.attemptCount = attemptCount;
+    this.providerDetail = providerDetail;
   }
 }
 
@@ -58,19 +60,28 @@ function reviewContentMarker(contentKey) {
   return `<!-- leetdash-opencode-review-content:${contentKey} -->`;
 }
 
+function reviewModelMarker(model) {
+  if (typeof model !== "string" || !/^[a-z0-9][a-z0-9./_-]*$/.test(model)) {
+    throw new TypeError("Invalid review model.");
+  }
+  return `<!-- leetdash-opencode-review-model:${model} -->`;
+}
+
 function parseManagedReviewMarker(body) {
   if (typeof body !== "string") return undefined;
   if (body === reviewSummaryMarker || body.startsWith(`${reviewSummaryMarker}\n`) || body.startsWith(`${reviewSummaryMarker}\r\n`)) {
     return { kind: "summary" };
   }
-  const [firstLine, secondLine] = body.split(/\r?\n/, 2);
+  const [firstLine, secondLine, thirdLine] = body.split(/\r?\n/, 3);
   const fileMatch = reviewFileMarkerPattern.exec(firstLine);
   if (!fileMatch) return undefined;
   const contentMatch = reviewContentMarkerPattern.exec(secondLine ?? "");
+  const modelMatch = reviewModelMarkerPattern.exec(thirdLine ?? "");
   return {
     kind: "file",
     key: fileMatch[1],
     ...(contentMatch ? { contentKey: contentMatch[1] } : {}),
+    ...(modelMatch ? { model: modelMatch[1] } : {}),
   };
 }
 
@@ -86,8 +97,8 @@ function buildReviewPrompt({ path, language, source }) {
 - 각 코멘트는 다음 형식을 정확히 따르세요:
   L{줄번호} \`{해당 코드 조각}\` [분류: 정확성/효율성/스타일/제약사항] 코멘트 내용
 - 분류 값은 정확성, 효율성, 스타일, 제약사항 중 하나만 사용하세요.
-- 코드 블록이 필요하면 언어별 마크다운 코드 펜스(\`\`\`{language})를 사용해 구문 하이라이팅이 적용되도록 하세요.
-- 한 코멘트가 여러 라인에 걸치면 L{시작}-{끝} 형식으로 범위를 표시하고 \`\`\`{language} 코드 블록 안에 해당 코드를 담으세요.
+- 각 코멘트는 물리적으로 한 줄로 작성하고 코드 펜스를 사용하지 마세요.
+- 한 코멘트가 여러 라인에 걸치면 L{시작}-L{끝} 형식으로 범위를 표시하고 핵심 코드 조각만 인라인 코드로 인용하세요.
 - 코드 식별자, 경로, 언어 키워드, API 이름, Big-O 표기는 정확성을 위해 원문을 유지할 수 있습니다. 모든 설명과 제안은 자연스러운 한국어로 작성하세요.
 - 코멘트할 사항이 전혀 없으면 "리뷰 코멘트 없음."만 반환하세요.
 
@@ -102,6 +113,29 @@ function buildReviewPrompt({ path, language, source }) {
 - 코드에서 직접 확인할 수 있는 잠재적 정확성 위험은 발생 조건과 개선 방법을 함께 제시하세요. 정답 여부를 판정하지 마세요.
 - 시간복잡도와 공간복잡도를 코드대로 추론하세요. 확인된 입력 제약과 결합해 문제가 되는 경우 또는 더 나은 구현을 구체적으로 제안할 수 있는 경우에만 해당 라인에 효율성 코멘트를 작성하세요.
 - 사용자가 상단 주석으로 이미 확인한 범위, 자료형, 특수 패키지 사항을 다시 경고하지 마세요.
+
+FEW-SHOT EXAMPLES
+다음 예시는 출력 형식과 코멘트를 작성할 판단 기준만 보여줍니다. 예시의 코드 패턴이나 제약사항을 실제 제출에 적용하거나 실제 제출에 대한 사실로 취급하지 마세요.
+
+EXAMPLE 1 INPUT
+- language: java
+CODE
+int last = values[values.length];
+
+EXAMPLE 1 OUTPUT
+L1 \`int last = values[values.length];\` [분류: 정확성] 배열의 마지막 유효 인덱스는 \`values.length - 1\`이므로 현재 접근은 항상 범위를 벗어납니다. 빈 배열을 먼저 처리한 뒤 \`values[values.length - 1]\`을 사용하세요.
+
+EXAMPLE 2 INPUT
+- language: java
+CODE
+// N <= 100,000; each value is between 0 and 1,000,000,000
+long sum = 0;
+for (int value : values) {
+    sum += value;
+}
+
+EXAMPLE 2 OUTPUT
+리뷰 코멘트 없음.
 
 출력은 리뷰 본문만 반환하세요. JSON, 제출 코드, 코드 펜스, 머리말, 맺음말을 반환하지 마세요.
 
@@ -219,6 +253,7 @@ function warningLines(failure) {
     `단계: ${markdownText(failure.stage)}`,
     `사유: ${markdownText(failure.reason)}`,
     `상세: ${markdownText(failure.detail)}`,
+    ...(failure.providerDetail === undefined ? [] : [`제공자 상세: ${markdownText(failure.providerDetail)}`]),
     `재시도 가능: ${failure.retryable ? "예" : "아니요"}`,
   ];
   if (failure.httpStatus !== undefined) lines.push(`HTTP 상태: ${markdownText(failure.httpStatus)}`);
@@ -228,28 +263,31 @@ function warningLines(failure) {
   return lines;
 }
 
-function renderReviewFileComment({ path, sourceUrl, contentKey, headSha, runUrl, mascotUrl, markdown, lineCount }) {
+function renderReviewFileComment({ path, sourceUrl, contentKey, model = "opencode-go/deepseek-v4-flash", headSha, runUrl, mascotUrl, markdown, lineCount }) {
   const permalink = Number.isInteger(lineCount) && lineCount > 0
     ? `${sourceUrl}#L1-L${lineCount}`
     : sourceUrl;
   return limitComment([
     reviewFileMarker(path),
     reviewContentMarker(contentKey),
+    reviewModelMarker(model),
     ...brandedHeader({ mascotUrl, title: "찰싹봇의 코드 리뷰" }),
     `파일: [${markdownText(path)}](${markdownText(permalink)})`,
     `커밋: ${markdownText(headSha)}`,
+    `모델: ${markdownText(model)}`,
     `워크플로: ${markdownText(runUrl)}`,
     "",
     markdown,
   ].join("\n"));
 }
 
-function renderReviewFileWarning({ path, sourceUrl, headSha, runUrl, mascotUrl, failure }) {
+function renderReviewFileWarning({ path, sourceUrl, model, headSha, runUrl, mascotUrl, failure }) {
   return limitComment([
     reviewFileMarker(path),
     ...brandedHeader({ mascotUrl, title: "찰싹봇 리뷰 경고" }),
     `파일: [${markdownText(path)}](${markdownText(sourceUrl)})`,
     `커밋: ${markdownText(headSha)}`,
+    ...(model ? [`모델: ${markdownText(model)}`] : []),
     ...warningLines(failure),
     `워크플로: ${markdownText(runUrl)}`,
   ].join("\n"));
@@ -317,6 +355,7 @@ export {
   renderReviewWarning,
   reviewContentKey,
   reviewContentMarker,
+  reviewModelMarker,
   reviewFileKey,
   reviewFileMarker,
   reviewSummaryMarker,

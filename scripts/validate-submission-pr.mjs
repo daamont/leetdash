@@ -4,6 +4,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const maxPullRequestFiles = 3000;
+const dynamicSweaProblemIdPattern = /^\d{1,8}$/;
+const sweaDifficulties = new Set(["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "Attack", "Unknown"]);
 
 const solutionExtensions = new Set([
   "c",
@@ -178,22 +180,31 @@ function isParticipantSubmissionPath(filePath) {
   return filePath.split("/").length >= 5;
 }
 
+function isDeletedSubmissionStatus(status) {
+  return status === "D" || status === "removed";
+}
+
 function isAllowedSubmissionStatus(status) {
   return status === "A"
     || status === "M"
     || status.startsWith("R")
     || status === "added"
     || status === "modified"
-    || status === "renamed";
+    || status === "renamed"
+    || isDeletedSubmissionStatus(status);
 }
 
-function validateMeta(filePath, errors) {
+function validateMetaSource(filePath, source, errors = []) {
   let parsed;
   try {
-    parsed = readJson(filePath);
+    parsed = JSON.parse(source);
   } catch {
     errors.push(`${filePath}: meta.json must be valid JSON.`);
-    return;
+    return errors;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    errors.push(`${filePath}: meta.json must be a JSON object.`);
+    return errors;
   }
 
   if (parsed.status !== undefined && !["solved", "reviewing", "skipped"].includes(String(parsed.status).toLowerCase())) {
@@ -211,6 +222,58 @@ function validateMeta(filePath, errors) {
       errors.push(`${filePath}: solvedAt must be a parseable date string.`);
     }
   }
+  if (parsed.problem !== undefined) {
+    const problem = parsed.problem;
+    const parts = filePath.split("/");
+    const sourceKey = parts.at(-3);
+    const submissionKey = parts.at(-2);
+    if (!problem || typeof problem !== "object" || Array.isArray(problem)) {
+      errors.push(`${filePath}: problem must be a JSON object.`);
+    } else {
+      if (problem.provider !== "swea" || sourceKey !== "swea") {
+        errors.push(`${filePath}: problem.provider must be swea and may only be used for SWEA submissions.`);
+      }
+      if (typeof problem.problemId !== "string" || problem.problemId !== submissionKey || !dynamicSweaProblemIdPattern.test(problem.problemId)) {
+        errors.push(`${filePath}: problem.problemId must match the numeric SWEA submission folder.`);
+      }
+      const title = typeof problem.title === "string" ? problem.title.trim() : "";
+      if (!title || title !== problem.title || title.length > 200 || /[\u0000-\u001f\u007f]/.test(title)) {
+        errors.push(`${filePath}: problem.title must be a trimmed 1-200 character string without control characters.`);
+      }
+      if (typeof problem.difficulty !== "string" || !sweaDifficulties.has(problem.difficulty)) {
+        errors.push(`${filePath}: problem.difficulty must be D1-D8, Attack, or Unknown.`);
+      }
+      let sourceUrl;
+      try {
+        sourceUrl = new URL(problem.sourceUrl);
+      } catch {
+        sourceUrl = undefined;
+      }
+      if (
+        typeof problem.sourceUrl !== "string"
+        || problem.sourceUrl.length > 2048
+        || !sourceUrl
+        || sourceUrl.protocol !== "https:"
+        || sourceUrl.username
+        || sourceUrl.password
+        || !["swexpertacademy.com", "www.swexpertacademy.com"].includes(sourceUrl.hostname)
+      ) {
+        errors.push(`${filePath}: problem.sourceUrl must be a safe HTTPS SW Expert Academy URL.`);
+      }
+    }
+  }
+  return errors;
+}
+
+function validateMeta(filePath, errors) {
+  let source;
+  try {
+    source = readFileSync(path.join(process.cwd(), filePath), "utf8");
+  } catch {
+    errors.push(`${filePath}: meta.json must be valid JSON.`);
+    return;
+  }
+  validateMetaSource(filePath, source, errors);
 }
 
 function validateSubmissionFiles(changedFiles, options = {}) {
@@ -227,6 +290,7 @@ function validateSubmissionFiles(changedFiles, options = {}) {
 
   for (const changedFile of changedFiles) {
     const filePath = changedFile.path;
+    const deleted = isDeletedSubmissionStatus(changedFile.status);
     const user = findUserForPath(users, filePath);
     if (!user) {
       errors.push(`${filePath}: submission path must belong to a registered user in data/users.json.`);
@@ -239,7 +303,7 @@ function validateSubmissionFiles(changedFiles, options = {}) {
     }
 
     if (!isAllowedSubmissionStatus(changedFile.status)) {
-      errors.push(`${filePath}: submission-only PRs may add, update, or rename files, not delete them.`);
+      errors.push(`${filePath}: unsupported submission change status ${changedFile.status}.`);
       continue;
     }
 
@@ -251,7 +315,8 @@ function validateSubmissionFiles(changedFiles, options = {}) {
     }
 
     const [sourceKey, submissionKey, filename] = parts;
-    if (!targets.has(`${sourceKey}/${submissionKey}`)) {
+    const isDynamicSweaTarget = sourceKey === "swea" && dynamicSweaProblemIdPattern.test(submissionKey);
+    if (!targets.has(`${sourceKey}/${submissionKey}`) && !isDynamicSweaTarget) {
       errors.push(`${filePath}: ${sourceKey}/${submissionKey} is not in data/problem-catalog.json.`);
     }
 
@@ -259,14 +324,33 @@ function validateSubmissionFiles(changedFiles, options = {}) {
       errors.push(`${filePath}: file must be solution.<supported ext>, README.md, or meta.json.`);
     }
 
-    if (checkFileExists && !existsSync(path.join(process.cwd(), filePath))) {
+    if (checkFileExists && !deleted && !existsSync(path.join(process.cwd(), filePath))) {
       errors.push(`${filePath}: changed file does not exist in the checkout.`);
-    } else if (checkFileExists && filename.toLowerCase() === "meta.json") {
+    } else if (checkFileExists && !deleted && filename.toLowerCase() === "meta.json") {
       validateMeta(filePath, errors);
     }
   }
 
   return errors;
+}
+
+function inspectSubmissionChanges(changedFiles, options = {}) {
+  const invalidSubmissionPaths = changedFiles.filter(
+    (file) => file.path.startsWith("submissions/")
+      && file.path !== "submissions/README.md"
+      && !isParticipantSubmissionPath(file.path),
+  );
+  const submissionFiles = changedFiles.filter((file) => isParticipantSubmissionPath(file.path));
+  const submissionOnly = changedFiles.length > 0 && submissionFiles.length === changedFiles.length;
+  const errors = invalidSubmissionPaths.map(
+    (file) => `${file.path}: expected submissions/<user>/<sourceKey>/<submissionKey>/<file>.`,
+  );
+
+  if (submissionFiles.length > 0) {
+    errors.push(...validateSubmissionFiles(submissionFiles, options));
+  }
+
+  return { submissionOnly, submissionFiles, errors };
 }
 
 function writeGithubOutput(name, value) {
@@ -285,29 +369,11 @@ function main() {
     changedFilesPath: args["changed-files"],
   });
 
-  const invalidSubmissionPaths = changedFiles.filter(
-    (file) => file.path.startsWith("submissions/") && file.path !== "submissions/README.md" && !isParticipantSubmissionPath(file.path),
-  );
-
-  if (invalidSubmissionPaths.length > 0) {
-    writeGithubOutput("submission_only", "false");
-    console.error("Invalid paths under submissions/:");
-    for (const file of invalidSubmissionPaths) {
-      console.error(`- ${file.path}`);
-    }
-    process.exitCode = 1;
-    return;
-  }
-
-  const submissionOnly = changedFiles.length > 0 && changedFiles.every((file) => isParticipantSubmissionPath(file.path));
+  const { submissionOnly, submissionFiles, errors } = inspectSubmissionChanges(changedFiles, {
+    authorLogin: args.author,
+  });
   writeGithubOutput("submission_only", String(submissionOnly));
 
-  if (!submissionOnly) {
-    console.log("submission_only=false");
-    return;
-  }
-
-  const errors = validateSubmissionFiles(changedFiles, { authorLogin: args.author });
   if (errors.length > 0) {
     console.error("Submission validation failed:");
     for (const error of errors) {
@@ -317,7 +383,12 @@ function main() {
     return;
   }
 
-  console.log(`submission_only=true; validated ${changedFiles.length} changed submission file(s).`);
+  if (submissionFiles.length === 0) {
+    console.log("submission_only=false");
+    return;
+  }
+
+  console.log(`submission_only=${submissionOnly}; validated ${submissionFiles.length} changed submission file(s).`);
 }
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
@@ -328,7 +399,9 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
 export {
   getChangedFiles,
   hasCompletePullRequestFileList,
+  inspectSubmissionChanges,
   isParticipantSubmissionPath,
   isSubmissionArtifactName,
+  validateMetaSource,
   validateSubmissionFiles,
 };

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -114,6 +114,54 @@ describe("validate-submission-pr", () => {
     expect(result.githubOutput).toBe("submission_only=true\n");
   });
 
+  it("accepts a numeric SWEA problem that is not in the checked-in catalog", async () => {
+    const repo = await createRepoFixture();
+    const problemDir = path.join(repo, "submissions", "ada", "swea", "76543210");
+    await mkdir(problemDir, { recursive: true });
+    await writeFile(path.join(problemDir, "Solution.java"), "class Solution {}\n");
+    await writeJson(path.join(problemDir, "meta.json"), {
+      status: "solved",
+      language: "Java",
+      solvedAt: "2026-08-23T12:00:00.000Z",
+      problem: {
+        provider: "swea",
+        problemId: "76543210",
+        title: "사용자 정의 문제",
+        difficulty: "Unknown",
+        sourceUrl: "https://swexpertacademy.com/main/code/problem/problemDetail.do?contestProbId=example",
+      },
+    });
+
+    const result = await runValidator(
+      repo,
+      "A\tsubmissions/ada/swea/76543210/Solution.java\nA\tsubmissions/ada/swea/76543210/meta.json\n",
+    );
+
+    expect(result.stdout).toContain("validated 2 changed submission file(s)");
+  });
+
+  it("rejects malformed dynamic SWEA IDs and mismatched problem snapshots", async () => {
+    const repo = await createRepoFixture();
+    const problemDir = path.join(repo, "submissions", "ada", "swea", "new-problem");
+    await mkdir(problemDir, { recursive: true });
+    await writeJson(path.join(problemDir, "meta.json"), {
+      problem: {
+        provider: "swea",
+        problemId: "123",
+        title: "잘못된 경로",
+        difficulty: "D9",
+        sourceUrl: "https://example.com/problem/123",
+      },
+    });
+
+    await expect(runValidator(repo, "A\tsubmissions/ada/swea/new-problem/meta.json\n")).rejects.toMatchObject({
+      stderr: expect.stringContaining("swea/new-problem is not in data/problem-catalog.json"),
+    });
+    await expect(runValidator(repo, "A\tsubmissions/ada/swea/new-problem/meta.json\n")).rejects.toMatchObject({
+      stderr: expect.stringContaining("problem.problemId must match the numeric SWEA submission folder"),
+    });
+  });
+
   it("keeps application changes on the full CI path", async () => {
     const repo = await createRepoFixture();
 
@@ -121,6 +169,36 @@ describe("validate-submission-pr", () => {
 
     expect(result.stdout).toContain("submission_only=false");
     expect(result.githubOutput).toBe("submission_only=false\n");
+  });
+
+  it("validates submission files in a mixed application pull request", async () => {
+    const repo = await createRepoFixture();
+
+    const result = await runValidatorForAuthor(
+      repo,
+      "ada",
+      "M\tapp/page.tsx\nM\tsubmissions/ada/top-interview-easy/1/Solution.java\n",
+    );
+
+    expect(result.stdout).toContain("submission_only=false; validated 1 changed submission file(s)");
+    expect(result.githubOutput).toBe("submission_only=false\n");
+  });
+
+  it("rejects an invalid submission filename in a mixed application pull request", async () => {
+    const repo = await createRepoFixture();
+    await writeFile(
+      path.join(repo, "submissions", "ada", "top-interview-easy", "1", "answer.java"),
+      "class Solution {}\n",
+    );
+
+    await expect(runValidatorForAuthor(
+      repo,
+      "ada",
+      "M\tapp/page.tsx\nA\tsubmissions/ada/top-interview-easy/1/answer.java\n",
+    )).rejects.toMatchObject({
+      stderr: expect.stringContaining("file must be solution.<supported ext>, README.md, or meta.json"),
+      githubOutput: "submission_only=false\n",
+    });
   });
 
   it("rejects submission-only changes for an unknown provider list", async () => {
@@ -134,13 +212,18 @@ describe("validate-submission-pr", () => {
     });
   });
 
-  it("rejects deletions in the fast submission-only path", async () => {
+  it("accepts replacing one catalog submission with another under the author path", async () => {
     const repo = await createRepoFixture();
+    await unlink(path.join(repo, "submissions", "ada", "programmers", "12906", "solution.java"));
 
-    await expect(runValidator(repo, "D\tsubmissions/ada/top-interview-easy/1/Solution.java\n")).rejects.toMatchObject({
-      stderr: expect.stringContaining("may add, update, or rename files, not delete them"),
-      githubOutput: "submission_only=true\n",
-    });
+    const result = await runValidatorForAuthor(
+      repo,
+      "ada",
+      "D\tsubmissions/ada/programmers/12906/solution.java\nA\tsubmissions/ada/swea/1206/solution.py\n",
+    );
+
+    expect(result.stdout).toContain("validated 2 changed submission file(s)");
+    expect(result.githubOutput).toBe("submission_only=true\n");
   });
 
   it("accepts submission-only changes under the pull request author path", async () => {

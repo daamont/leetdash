@@ -1,15 +1,53 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  getOpenCodeModelProfile,
   isRetryableStatus,
-  openCodeApiModel,
-  openCodeChatCompletionsUrl,
   openCodeRequestTimeoutMs,
   parseAssistantResponse,
+  parseMessagesAssistantResponse,
 } from "./opencode-api-contract.mjs";
 import { parseManagedReviewMarker, ReviewFailure } from "./opencode-review-core.mjs";
 
-const openCodeConfiguredModel = "opencode-go/deepseek-v4-flash";
+const goUsageLimitErrorName = "GoUsageLimitError";
+const maxProviderDetailFieldLength = 300;
+const maxProviderDetailLength = 700;
+
+function redactProviderDetail(value, sensitiveValues) {
+  let sanitized = String(value)
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  for (const sensitiveValue of sensitiveValues) {
+    if (typeof sensitiveValue === "string" && sensitiveValue.length > 0) {
+      sanitized = sanitized.replaceAll(sensitiveValue, "[REDACTED]");
+    }
+  }
+  sanitized = sanitized
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9._-]{8,}\b/gi, "[REDACTED]");
+  return sanitized.length <= maxProviderDetailFieldLength
+    ? sanitized
+    : `${sanitized.slice(0, maxProviderDetailFieldLength - 1)}\u2026`;
+}
+
+function extractSafeProviderDetail(body, { apiKey, prompt } = {}) {
+  const error = body?.error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return undefined;
+  const sensitiveValues = [apiKey, prompt];
+  const fields = [];
+  for (const name of ["code", "type", "message"]) {
+    const value = error[name];
+    if (typeof value !== "string" && typeof value !== "number") continue;
+    const sanitized = redactProviderDetail(value, sensitiveValues);
+    if (sanitized) fields.push(`${name}=${sanitized}`);
+  }
+  if (fields.length === 0) return undefined;
+  const detail = fields.join(" | ");
+  return detail.length <= maxProviderDetailLength
+    ? detail
+    : `${detail.slice(0, maxProviderDetailLength - 1)}\u2026`;
+}
 
 function extractRequestId(response) {
   const headers = response?.headers;
@@ -21,7 +59,7 @@ function extractRequestId(response) {
   return undefined;
 }
 
-function toSafeHttpFailure({ stage, reason, response, clientRequestId, detail = "External service request failed." }) {
+function toSafeHttpFailure({ stage, reason, response, clientRequestId, detail = "External service request failed.", providerDetail }) {
   const httpStatus = response?.status;
   return new ReviewFailure({
     stage,
@@ -31,6 +69,7 @@ function toSafeHttpFailure({ stage, reason, response, clientRequestId, detail = 
     ...(httpStatus === undefined ? {} : { httpStatus }),
     ...(extractRequestId(response) === undefined ? {} : { requestId: extractRequestId(response) }),
     clientRequestId,
+    providerDetail,
   });
 }
 
@@ -76,7 +115,8 @@ class OpenCodeClient {
   }
 
   async review({ model, apiKey, prompt, attempt = 1 }) {
-    if (model !== openCodeConfiguredModel) {
+    const profile = getOpenCodeModelProfile(model);
+    if (!profile) {
       throw new ReviewFailure({
         stage: "model-request",
         reason: "MODEL_REQUEST_FAILED",
@@ -85,7 +125,7 @@ class OpenCodeClient {
     }
 
     const clientRequestId = this.requestIdFactory();
-    const logOutcome = ({ outcome, status, requestId }) => {
+    const logOutcome = ({ outcome, status, requestId, providerDetail }) => {
       const fields = [
         `outcome=${outcome}`,
         `attempt=${attempt}`,
@@ -93,6 +133,7 @@ class OpenCodeClient {
       ];
       if (status !== undefined) fields.push(`status=${status}`);
       if (requestId !== undefined) fields.push(`provider_request_id=${requestId}`);
+      if (providerDetail !== undefined) fields.push(`provider_detail=${JSON.stringify(providerDetail)}`);
       try {
         this.logger?.log?.(`OpenCode request ${fields.join(" ")}`);
       } catch {
@@ -123,18 +164,31 @@ class OpenCodeClient {
     try {
       let response;
       try {
+        const requestBody = profile.protocol === "messages"
+          ? {
+              model: profile.apiModel,
+              max_tokens: profile.maxTokens,
+              messages: [{ role: "user", content: prompt }],
+            }
+          : {
+              model: profile.apiModel,
+              messages: [{ role: "user", content: prompt }],
+            };
+        const authenticationHeaders = profile.protocol === "messages"
+          ? {
+              "x-api-key": apiKey,
+              "anthropic-version": "2023-06-01",
+            }
+          : { Authorization: `Bearer ${apiKey}` };
         response = await Promise.race([
-          this.fetchImpl(openCodeChatCompletionsUrl, {
+          this.fetchImpl(profile.url, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey}`,
+              ...authenticationHeaders,
               "x-opencode-request": clientRequestId,
             },
-            body: JSON.stringify({
-              model: openCodeApiModel,
-              messages: [{ role: "user", content: prompt }],
-            }),
+            body: JSON.stringify(requestBody),
             signal: controller.signal,
           }),
           timeoutFailure,
@@ -145,41 +199,73 @@ class OpenCodeClient {
         throw failure;
       }
 
+      let rawBody;
+      let body;
+      try {
+        if (typeof response?.text === "function") {
+          rawBody = await Promise.race([response.text(), timeoutFailure]);
+          try {
+            body = JSON.parse(rawBody);
+          } catch {
+            body = undefined;
+          }
+        } else {
+          body = await Promise.race([response?.json?.(), timeoutFailure]);
+          rawBody = JSON.stringify(body);
+        }
+      } catch (error) {
+        if (error instanceof ReviewFailure) {
+          logOutcome({ outcome: "failure" });
+          throw error;
+        }
+        const failure = response?.ok
+          ? new ReviewFailure({
+              stage: "model-response",
+              reason: "MODEL_RESPONSE_INVALID",
+              detail: "OpenCode returned an invalid response.",
+              clientRequestId,
+            })
+          : toSafeHttpFailure({
+              stage: "model-request",
+              reason: "MODEL_REQUEST_FAILED",
+              response,
+              clientRequestId,
+            });
+        logOutcome({ outcome: "failure", status: response?.status, requestId: extractRequestId(response) });
+        throw failure;
+      }
+
+      if (typeof rawBody === "string" && rawBody.includes(goUsageLimitErrorName)) {
+        const failure = new ReviewFailure({
+          stage: "model-request",
+          reason: "MODEL_USAGE_LIMIT_EXHAUSTED",
+          detail: "OpenCode Go model usage limit is exhausted.",
+          retryable: false,
+          ...(response?.status === undefined ? {} : { httpStatus: response.status }),
+          ...(extractRequestId(response) === undefined ? {} : { requestId: extractRequestId(response) }),
+          clientRequestId,
+        });
+        logOutcome({ outcome: "usage-limit", status: response?.status, requestId: extractRequestId(response) });
+        throw failure;
+      }
+
       if (!response?.ok) {
+        const providerDetail = extractSafeProviderDetail(body, { apiKey, prompt });
         const failure = toSafeHttpFailure({
           stage: "model-request",
           reason: "MODEL_REQUEST_FAILED",
           response,
           clientRequestId,
           detail: `OpenCode request failed (HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}).`,
+          providerDetail,
         });
-        logOutcome({ outcome: "failure", status: failure.httpStatus, requestId: failure.requestId });
+        logOutcome({ outcome: "failure", status: failure.httpStatus, requestId: failure.requestId, providerDetail });
         throw failure;
       }
 
-      let body;
-      try {
-        body = await Promise.race([response.json(), timeoutFailure]);
-      } catch (error) {
-        if (error instanceof ReviewFailure) {
-          logOutcome({ outcome: "failure" });
-          throw error;
-        }
-        if (controller.signal.aborted) {
-          const failure = requestFailure();
-          logOutcome({ outcome: "failure" });
-          throw failure;
-        }
-        const failure = new ReviewFailure({
-          stage: "model-response",
-          reason: "MODEL_RESPONSE_INVALID",
-          detail: "OpenCode returned an invalid response.",
-          clientRequestId,
-        });
-        logOutcome({ outcome: "failure", status: response.status, requestId: extractRequestId(response) });
-        throw failure;
-      }
-      const parsed = parseAssistantResponse(body);
+      const parsed = profile.protocol === "messages"
+        ? parseMessagesAssistantResponse(body)
+        : parseAssistantResponse(body);
       if (!parsed.ok) {
         const failure = new ReviewFailure({
           stage: "model-response",

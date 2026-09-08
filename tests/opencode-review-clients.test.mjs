@@ -39,6 +39,82 @@ describe("OpenCodeClient", () => {
     ]);
   });
 
+  it("uses chat completions for MiMo", async () => {
+    const requests = [];
+    const client = new OpenCodeClient({
+      fetchImpl: async (url, init) => {
+        requests.push({ url: String(url), body: JSON.parse(init.body) });
+        return jsonResponse({ choices: [{ message: { role: "assistant", content: "MiMo review" } }] });
+      },
+    });
+
+    await expect(client.review({
+      model: "opencode-go/mimo-v2.5",
+      apiKey: "test-secret",
+      prompt: "review prompt",
+    })).resolves.toBe("MiMo review");
+    expect(requests).toEqual([{
+      url: "https://opencode.ai/zen/go/v1/chat/completions",
+      body: { model: "mimo-v2.5", messages: [{ role: "user", content: "review prompt" }] },
+    }]);
+  });
+
+  it("uses Anthropic messages for Qwen and returns only validated text blocks", async () => {
+    const requests = [];
+    const client = new OpenCodeClient({
+      fetchImpl: async (url, init) => {
+        requests.push({ url: String(url), headers: init.headers, body: JSON.parse(init.body) });
+        return jsonResponse({
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "Qwen review" }],
+        });
+      },
+    });
+
+    await expect(client.review({
+      model: "opencode-go/qwen3.7-plus",
+      apiKey: "test-secret",
+      prompt: "review prompt",
+    })).resolves.toBe("Qwen review");
+    expect(requests).toEqual([{
+      url: "https://opencode.ai/zen/go/v1/messages",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": "test-secret",
+        "anthropic-version": "2023-06-01",
+        "x-opencode-request": expect.any(String),
+      },
+      body: {
+        model: "qwen3.7-plus",
+        max_tokens: 8192,
+        messages: [{ role: "user", content: "review prompt" }],
+      },
+    }]);
+  });
+
+  it("classifies only an explicit GoUsageLimitError body as an exhausted model quota without leaking it", async () => {
+    const rawBody = "provider-secret GoUsageLimitError account-internal";
+    const client = new OpenCodeClient({
+      fetchImpl: async () => new Response(rawBody, { status: 429, headers: { "request-id": "usage-1" } }),
+    });
+
+    const failure = await client.review({
+      model: "opencode-go/deepseek-v4-flash",
+      apiKey: "api-secret",
+      prompt: "submitted-source-secret",
+    }).catch((error) => error);
+
+    expect(failure).toMatchObject({
+      stage: "model-request",
+      reason: "MODEL_USAGE_LIMIT_EXHAUSTED",
+      retryable: false,
+      httpStatus: 429,
+      requestId: "usage-1",
+    });
+    expect(JSON.stringify(failure)).not.toContain(rawBody);
+    expect(failure.detail).not.toMatch(/provider-secret|account-internal|submitted-source-secret|api-secret/);
+  });
+
   it("times out stalled response-body parsing with a sanitized model-request failure", async () => {
     vi.useFakeTimers();
     const apiKey = "body-timeout-api-key";
@@ -126,6 +202,60 @@ describe("OpenCodeClient", () => {
       retryable: false,
       httpStatus: status,
     });
+  });
+
+  it("exposes sanitized structured provider errors in failures and request logs", async () => {
+    const logs = [];
+    const apiKey = "sk-super-secret-api-key";
+    const prompt = "submitted-source-secret";
+    const client = new OpenCodeClient({
+      fetchImpl: async () => jsonResponse({
+        error: {
+          code: "400",
+          type: "bad_request_error",
+          message: `No allowed providers are available; key=${apiKey}; prompt=${prompt}`,
+        },
+      }, { status: 400 }),
+      logger: { log: (message) => { logs.push(message); } },
+      requestIdFactory: () => "client-request-42",
+    });
+
+    const failure = await client.review({
+      model: "opencode-go/mimo-v2.5",
+      apiKey,
+      prompt,
+    }).catch((error) => error);
+
+    expect(failure).toMatchObject({
+      providerDetail: "code=400 | type=bad_request_error | message=No allowed providers are available; key=[REDACTED]; prompt=[REDACTED]",
+    });
+    expect(logs).toEqual([
+      'OpenCode request outcome=failure attempt=1 client_request_id=client-request-42 status=400 provider_detail="code=400 | type=bad_request_error | message=No allowed providers are available; key=[REDACTED]; prompt=[REDACTED]"',
+    ]);
+    expect(JSON.stringify({ failure, logs })).not.toMatch(/sk-super-secret-api-key|submitted-source-secret/);
+  });
+
+  it("limits provider diagnostics and ignores unapproved response fields", async () => {
+    const client = new OpenCodeClient({
+      fetchImpl: async () => jsonResponse({
+        error: {
+          code: "c".repeat(2_000),
+          type: "t".repeat(2_000),
+          message: "x".repeat(2_000),
+        },
+        request: { prompt: "must-not-be-exposed" },
+      }, { status: 400 }),
+    });
+
+    const failure = await client.review({
+      model: "opencode-go/mimo-v2.5",
+      apiKey: "test-secret",
+      prompt: "review prompt",
+    }).catch((error) => error);
+
+    expect(failure.providerDetail).toMatch(/^code=c+\u2026 \| type=t+\u2026 \| message=x+\u2026$/);
+    expect(failure.providerDetail.length).toBeLessThanOrEqual(700);
+    expect(failure.providerDetail).not.toContain("must-not-be-exposed");
   });
 
   it("redacts API keys and provider response bodies from request failures", async () => {
