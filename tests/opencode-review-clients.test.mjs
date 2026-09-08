@@ -59,6 +59,24 @@ describe("OpenCodeClient", () => {
     }]);
   });
 
+  it("sends one stable OpenCode session ID across request protocols", async () => {
+    const sessionHeaders = [];
+    const client = new OpenCodeClient({
+      fetchImpl: async (url, init) => {
+        sessionHeaders.push(init.headers["x-opencode-session"]);
+        return String(url).endsWith("/messages")
+          ? jsonResponse({ role: "assistant", content: [{ type: "text", text: "Qwen review" }] })
+          : jsonResponse({ choices: [{ message: { role: "assistant", content: "MiMo review" } }] });
+      },
+      sessionIdFactory: () => "stable-session-42",
+    });
+
+    await client.review({ model: "opencode-go/mimo-v2.5", apiKey: "test-secret", prompt: "first prompt" });
+    await client.review({ model: "opencode-go/qwen3.7-plus", apiKey: "test-secret", prompt: "second prompt" });
+
+    expect(sessionHeaders).toEqual(["stable-session-42", "stable-session-42"]);
+  });
+
   it("uses Anthropic messages for Qwen and returns only validated text blocks", async () => {
     const requests = [];
     const client = new OpenCodeClient({
@@ -69,6 +87,7 @@ describe("OpenCodeClient", () => {
           content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "Qwen review" }],
         });
       },
+      sessionIdFactory: () => "stable-session-42",
     });
 
     await expect(client.review({
@@ -83,6 +102,7 @@ describe("OpenCodeClient", () => {
         "x-api-key": "test-secret",
         "anthropic-version": "2023-06-01",
         "x-opencode-request": expect.any(String),
+        "x-opencode-session": "stable-session-42",
       },
       body: {
         model: "qwen3.7-plus",
