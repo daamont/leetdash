@@ -108,10 +108,11 @@ function toSafeGitHubFailure(FailureType, response) {
 }
 
 class OpenCodeClient {
-  constructor({ fetchImpl = fetch, logger = console, requestIdFactory = randomUUID } = {}) {
+  constructor({ fetchImpl = fetch, logger = console, requestIdFactory = randomUUID, sessionIdFactory = randomUUID } = {}) {
     this.fetchImpl = fetchImpl;
     this.logger = logger;
     this.requestIdFactory = requestIdFactory;
+    this.sessionId = sessionIdFactory();
   }
 
   async review({ model, apiKey, prompt, attempt = 1 }) {
@@ -187,6 +188,7 @@ class OpenCodeClient {
               "Content-Type": "application/json",
               ...authenticationHeaders,
               "x-opencode-request": clientRequestId,
+              "x-opencode-session": this.sessionId,
             },
             body: JSON.stringify(requestBody),
             signal: controller.signal,
